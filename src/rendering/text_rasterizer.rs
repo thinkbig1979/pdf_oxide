@@ -1370,7 +1370,10 @@ impl TextRasterizer {
                                     let py = y_cursor + y_offset + paint_origin_dy + rise_y;
                                     let cjk_transform = combined_base
                                         .pre_translate(px, py)
-                                        .pre_scale(cjk_scale, -cjk_scale);
+                                        .pre_scale(cjk_scale, cjk_scale);
+                                    // fastpdf #1098: combined_base already carries the
+                                    // PDF-to-raster Y flip; a negative Y here double-flips
+                                    // and mirrors every fallback glyph about its baseline.
                                     pixmap.fill_path(
                                         &cjk_path,
                                         paint,
