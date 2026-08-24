@@ -35,6 +35,51 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tiny_skia::{Color, PathBuilder, Pixmap, PixmapPaint, Transform};
 
+/// FastPDF-s8k perf fix: compute the device-space bounding box a
+/// path-paint (fill/stroke) touches, padded by `pad` pixels for AA bleed
+/// and clamped to the canvas. `path.bounds()` is in path-local
+/// (pre-transform) space; since `transform` may rotate or skew, all four
+/// corners of the local bbox are mapped and then re-enclosed, which stays
+/// a valid (if occasionally slightly loose) axis-aligned superset of the
+/// true device-space footprint. Returns `None` for a degenerate/empty
+/// result so the caller falls back to full-canvas (never wrong, just
+/// slow — matches the previous, unconditional behaviour).
+fn bbox_for_path_paint(
+    path: &tiny_skia::Path,
+    transform: Transform,
+    canvas_w: u32,
+    canvas_h: u32,
+    pad: f32,
+) -> Option<(u32, u32, u32, u32)> {
+    let b = path.bounds();
+    let mut pts = [
+        tiny_skia::Point::from_xy(b.left(), b.top()),
+        tiny_skia::Point::from_xy(b.right(), b.top()),
+        tiny_skia::Point::from_xy(b.left(), b.bottom()),
+        tiny_skia::Point::from_xy(b.right(), b.bottom()),
+    ];
+    transform.map_points(&mut pts);
+    let (mut min_x, mut min_y, mut max_x, mut max_y) =
+        (f32::INFINITY, f32::INFINITY, f32::NEG_INFINITY, f32::NEG_INFINITY);
+    for p in &pts {
+        min_x = min_x.min(p.x);
+        min_y = min_y.min(p.y);
+        max_x = max_x.max(p.x);
+        max_y = max_y.max(p.y);
+    }
+    if !min_x.is_finite() || !min_y.is_finite() || !max_x.is_finite() || !max_y.is_finite() {
+        return None;
+    }
+    let x0 = (min_x - pad).floor().max(0.0) as u32;
+    let y0 = (min_y - pad).floor().max(0.0) as u32;
+    let x1 = (((max_x + pad).ceil().max(0.0)) as u32).min(canvas_w);
+    let y1 = (((max_y + pad).ceil().max(0.0)) as u32).min(canvas_h);
+    if x1 <= x0 || y1 <= y0 {
+        return None;
+    }
+    Some((x0, y0, x1, y1))
+}
+
 /// Which path-paint side(s) [`PageRenderer::pipeline_resolve_paint_gs`]
 /// should resolve for the current operator.
 ///
@@ -1669,7 +1714,21 @@ impl PageRenderer {
                                 false,
                             );
                             if let Some(snap) = smask_snap {
-                                self.apply_smask_after_paint(
+                                // Stroke geometry extends beyond path.bounds()
+                                // by ~half the device-space line width; pad
+                                // generously (line width + 4px) so the AA'd
+                                // stroke edge is fully inside the bbox.
+                                let (sx, sy) = transform.get_scale();
+                                let stroke_pad =
+                                    4.0 + gs_clone.line_width * sx.abs().max(sy.abs());
+                                let bbox = bbox_for_path_paint(
+                                    &path,
+                                    transform,
+                                    pixmap.width(),
+                                    pixmap.height(),
+                                    stroke_pad,
+                                );
+                                self.apply_smask_after_paint_bbox(
                                     pixmap,
                                     &snap,
                                     smask_spot_snap.as_deref(),
@@ -1678,6 +1737,7 @@ impl PageRenderer {
                                     page_num,
                                     resources,
                                     base_transform,
+                                    bbox,
                                 )?;
                             }
                         }
@@ -1808,7 +1868,14 @@ impl PageRenderer {
                                     true,
                                 );
                                 if let Some(snap) = smask_snap {
-                                    self.apply_smask_after_paint(
+                                    let bbox = bbox_for_path_paint(
+                                        &path,
+                                        transform,
+                                        pixmap.width(),
+                                        pixmap.height(),
+                                        2.0,
+                                    );
+                                    self.apply_smask_after_paint_bbox(
                                         pixmap,
                                         &snap,
                                         smask_spot_snap.as_deref(),
@@ -1817,6 +1884,7 @@ impl PageRenderer {
                                         page_num,
                                         resources,
                                         base_transform,
+                                        bbox,
                                     )?;
                                 }
                             }
@@ -1947,7 +2015,14 @@ impl PageRenderer {
                                     );
                                 }
                                 if let Some(snap) = fill_smask_snap {
-                                    self.apply_smask_after_paint(
+                                    let bbox = bbox_for_path_paint(
+                                        &path,
+                                        transform,
+                                        pixmap.width(),
+                                        pixmap.height(),
+                                        2.0,
+                                    );
+                                    self.apply_smask_after_paint_bbox(
                                         pixmap,
                                         &snap,
                                         fill_smask_spot_snap.as_deref(),
@@ -1956,6 +2031,7 @@ impl PageRenderer {
                                         page_num,
                                         resources,
                                         base_transform,
+                                        bbox,
                                     )?;
                                 }
                             }
@@ -1994,7 +2070,17 @@ impl PageRenderer {
                                 );
                             }
                             if let Some(snap) = stroke_smask_snap {
-                                self.apply_smask_after_paint(
+                                let (sx, sy) = transform.get_scale();
+                                let stroke_pad =
+                                    4.0 + gs_clone.line_width * sx.abs().max(sy.abs());
+                                let bbox = bbox_for_path_paint(
+                                    &path,
+                                    transform,
+                                    pixmap.width(),
+                                    pixmap.height(),
+                                    stroke_pad,
+                                );
+                                self.apply_smask_after_paint_bbox(
                                     pixmap,
                                     &snap,
                                     stroke_smask_spot_snap.as_deref(),
@@ -2003,6 +2089,7 @@ impl PageRenderer {
                                     page_num,
                                     resources,
                                     base_transform,
+                                    bbox,
                                 )?;
                             }
                         }
@@ -2108,7 +2195,14 @@ impl PageRenderer {
                                     );
                                 }
                                 if let Some(snap) = fill_smask_snap {
-                                    self.apply_smask_after_paint(
+                                    let bbox = bbox_for_path_paint(
+                                        &path,
+                                        transform,
+                                        pixmap.width(),
+                                        pixmap.height(),
+                                        2.0,
+                                    );
+                                    self.apply_smask_after_paint_bbox(
                                         pixmap,
                                         &snap,
                                         fill_smask_spot_snap.as_deref(),
@@ -2117,6 +2211,7 @@ impl PageRenderer {
                                         page_num,
                                         resources,
                                         base_transform,
+                                        bbox,
                                     )?;
                                 }
                             }
@@ -2156,7 +2251,17 @@ impl PageRenderer {
                                     );
                                 }
                                 if let Some(snap) = stroke_smask_snap {
-                                    self.apply_smask_after_paint(
+                                    let (sx, sy) = transform.get_scale();
+                                    let stroke_pad =
+                                        4.0 + gs_clone.line_width * sx.abs().max(sy.abs());
+                                    let bbox = bbox_for_path_paint(
+                                        &path,
+                                        transform,
+                                        pixmap.width(),
+                                        pixmap.height(),
+                                        stroke_pad,
+                                    );
+                                    self.apply_smask_after_paint_bbox(
                                         pixmap,
                                         &snap,
                                         stroke_smask_spot_snap.as_deref(),
@@ -2165,6 +2270,7 @@ impl PageRenderer {
                                         page_num,
                                         resources,
                                         base_transform,
+                                        bbox,
                                     )?;
                                 }
                             }
@@ -7280,6 +7386,42 @@ impl PageRenderer {
         resources: &Object,
         base_transform: Transform,
     ) -> Result<()> {
+        self.apply_smask_after_paint_bbox(
+            pixmap,
+            snapshot,
+            spot_snapshot,
+            gs,
+            doc,
+            page_num,
+            resources,
+            base_transform,
+            None,
+        )
+    }
+
+    /// FastPDF-s8k perf fix: device-space-bbox-scoped variant of
+    /// [`Self::apply_smask_after_paint`]. `paint_bbox` is the device-space
+    /// `(x0, y0, x1, y1)` (half-open, already clamped to the canvas) that
+    /// the just-completed paint touched; when `Some`, the per-pixel mask
+    /// blend and the `/BC` backdrop pre-fill in
+    /// `apply_smask_after_paint_inner` are scoped to that rect instead of
+    /// the full canvas — outside it, the paint didn't change `pixmap`, so
+    /// `dest` already equals `snapshot` there and skipping the blend is a
+    /// no-op, not an approximation. `None` preserves the original
+    /// full-canvas behaviour (safe fallback for call sites without an
+    /// easy bbox).
+    fn apply_smask_after_paint_bbox(
+        &mut self,
+        pixmap: &mut Pixmap,
+        snapshot: &[u8],
+        spot_snapshot: Option<&[u8]>,
+        gs: &GraphicsState,
+        doc: &PdfDocument,
+        page_num: usize,
+        resources: &Object,
+        base_transform: Transform,
+        paint_bbox: Option<(u32, u32, u32, u32)>,
+    ) -> Result<()> {
         let smask = match gs.smask.as_ref() {
             Some(s) => s.clone(),
             None => return Ok(()),
@@ -7310,6 +7452,7 @@ impl PageRenderer {
             page_num,
             resources,
             base_transform,
+            paint_bbox,
         );
         self.smask_depth -= 1;
         result
@@ -7325,6 +7468,7 @@ impl PageRenderer {
         page_num: usize,
         resources: &Object,
         base_transform: Transform,
+        paint_bbox: Option<(u32, u32, u32, u32)>,
     ) -> Result<()> {
         // Render the Form XObject into a fresh pixmap. The pixmap
         // starts fully transparent for /S /Alpha (the spec default
@@ -7414,13 +7558,25 @@ impl PageRenderer {
                     },
                     _ => (0, 0, 0),
                 };
+                // FastPDF-s8k perf fix: the blend loop below never reads
+                // `mask_pixmap` outside `paint_bbox` (it only iterates
+                // that rect), so pre-filling pixels outside it with the
+                // backdrop colour is pure waste — scope this loop the
+                // same way. Pixels the form-render step below paints
+                // outside the bbox are equally never consulted afterward.
+                let (pbx0, pby0, pbx1, pby1) = paint_bbox.unwrap_or((0, 0, w, h));
+                let (pbx0, pby0) = (pbx0.min(w), pby0.min(h));
+                let (pbx1, pby1) = (pbx1.min(w), pby1.min(h));
                 let data = mask_pixmap.data_mut();
-                for px in 0..(w * h) as usize {
-                    let off = px * 4;
-                    data[off] = r;
-                    data[off + 1] = g;
-                    data[off + 2] = b;
-                    data[off + 3] = 255;
+                for y in pby0..pby1 {
+                    let row_base = y as usize * w as usize;
+                    for x in pbx0..pbx1 {
+                        let off = (row_base + x as usize) * 4;
+                        data[off] = r;
+                        data[off + 1] = g;
+                        data[off + 2] = b;
+                        data[off + 3] = 255;
+                    }
                 }
             }
         }
@@ -7473,32 +7629,48 @@ impl PageRenderer {
         // is allocated, every spot lane against its pre-mirror
         // snapshot.
         let pixel_count = dest.len() / 4;
-        let mut mask_alpha: Vec<f32> = Vec::with_capacity(pixel_count);
-        for px in 0..pixel_count {
-            let off = px * 4;
-            let mut m = match smask.subtype {
-                crate::content::graphics_state::SoftMaskSubtype::Alpha => {
-                    mask_data[off + 3] as f32 / 255.0
-                },
-                crate::content::graphics_state::SoftMaskSubtype::Luminosity => {
-                    let r = mask_data[off] as f32 / 255.0;
-                    let g = mask_data[off + 1] as f32 / 255.0;
-                    let b = mask_data[off + 2] as f32 / 255.0;
-                    0.30 * r + 0.59 * g + 0.11 * b
-                },
-            };
+        // FastPDF-s8k perf fix: `mask_alpha` is still allocated at full
+        // canvas size (the spot-lane loop below indexes it by the same
+        // flat `px` the un-scoped loop used, and staying full-size keeps
+        // that indexing valid without a second remap). Filled with 1.0
+        // (= "no change") outside `paint_bbox` — outside the just-painted
+        // region `dest` already equals `snapshot` (the paint didn't touch
+        // those pixels), so leaving their nominal mask alpha at identity
+        // is a no-op for both the pixmap blend below and the spot-lane
+        // attenuation, not an approximation.
+        let mut mask_alpha: Vec<f32> = vec![1.0f32; pixel_count];
+        let (bx0, by0, bx1, by1) = paint_bbox.unwrap_or((0, 0, w, h));
+        let (bx0, by0) = (bx0.min(w), by0.min(h));
+        let (bx1, by1) = (bx1.min(w), by1.min(h));
+        for y in by0..by1 {
+            let row_base = y as usize * w as usize;
+            for x in bx0..bx1 {
+                let px = row_base + x as usize;
+                let off = px * 4;
+                let mut m = match smask.subtype {
+                    crate::content::graphics_state::SoftMaskSubtype::Alpha => {
+                        mask_data[off + 3] as f32 / 255.0
+                    },
+                    crate::content::graphics_state::SoftMaskSubtype::Luminosity => {
+                        let r = mask_data[off] as f32 / 255.0;
+                        let g = mask_data[off + 1] as f32 / 255.0;
+                        let b = mask_data[off + 2] as f32 / 255.0;
+                        0.30 * r + 0.59 * g + 0.11 * b
+                    },
+                };
 
-            if let Some(ref tf) = transfer {
-                m = tf.eval(m).clamp(0.0, 1.0);
-            }
-            mask_alpha.push(m);
+                if let Some(ref tf) = transfer {
+                    m = tf.eval(m).clamp(0.0, 1.0);
+                }
+                mask_alpha[px] = m;
 
-            let inv_m = 1.0 - m;
-            for c in 0..4 {
-                let painted = dest[off + c] as f32;
-                let backed = snapshot[off + c] as f32;
-                let blended = m * painted + inv_m * backed;
-                dest[off + c] = blended.clamp(0.0, 255.0).round() as u8;
+                let inv_m = 1.0 - m;
+                for c in 0..4 {
+                    let painted = dest[off + c] as f32;
+                    let backed = snapshot[off + c] as f32;
+                    let blended = m * painted + inv_m * backed;
+                    dest[off + c] = blended.clamp(0.0, 255.0).round() as u8;
+                }
             }
         }
 
