@@ -5606,7 +5606,20 @@ impl PageRenderer {
             None
         };
         let stroke = tiny_skia::Stroke {
-            width: gs.line_width,
+            width: {
+                // fastpdf #1100: ISO 32000-1 8.4.3.2 renders width 0 as the
+                // thinnest visible line; a positive width that lands sub-pixel
+                // in device space must not fade below that floor. Hand
+                // tiny-skia 0 (its full-coverage hairline) instead.
+                let s = (transform.sx * transform.sy - transform.kx * transform.ky)
+                    .abs()
+                    .sqrt();
+                if gs.line_width * s < 1.0 && gs.line_width > 0.0 {
+                    0.0
+                } else {
+                    gs.line_width
+                }
+            },
             line_cap: match gs.line_cap {
                 1 => tiny_skia::LineCap::Round,
                 2 => tiny_skia::LineCap::Square,
