@@ -4171,6 +4171,18 @@ impl PageRenderer {
                                 let mask_gray = mask_dyn.to_luma8();
                                 let mw = mask_gray.width();
                                 let mh = mask_gray.height();
+                                // fastpdf #1127: same finer-resolution rule as
+                                // the /SMask path below.
+                                if mw > rgba_image.width() || mh > rgba_image.height() {
+                                    let ow = mw.max(rgba_image.width());
+                                    let oh = mh.max(rgba_image.height());
+                                    rgba_image = image::imageops::resize(
+                                        &rgba_image,
+                                        ow,
+                                        oh,
+                                        image::imageops::FilterType::Triangle,
+                                    );
+                                }
                                 let iw = rgba_image.width();
                                 let ih = rgba_image.height();
                                 for y in 0..ih {
@@ -4249,6 +4261,20 @@ impl PageRenderer {
                                                 raw_mask_data
                                             };
                                             // 1-bit mask: each byte has 8 pixels, MSB first
+                                            // fastpdf #1127: same finer-resolution
+                                            // rule as the /SMask path below.
+                                            if mw > rgba_image.width()
+                                                || mh > rgba_image.height()
+                                            {
+                                                let ow = mw.max(rgba_image.width());
+                                                let oh = mh.max(rgba_image.height());
+                                                rgba_image = image::imageops::resize(
+                                                    &rgba_image,
+                                                    ow,
+                                                    oh,
+                                                    image::imageops::FilterType::Triangle,
+                                                );
+                                            }
                                             let iw = rgba_image.width();
                                             let ih = rgba_image.height();
                                             let row_bytes = (mw as usize + 7) / 8;
@@ -4315,9 +4341,25 @@ impl PageRenderer {
                         let smask_gray = smask_dyn.to_luma8();
 
                         // Apply SMask to alpha channel
-                        // Rescale smask if dimensions don't match (simplification)
+                        // fastpdf #1127: composite at the finer of the two
+                        // resolutions. When the mask carries more detail than
+                        // the base image (PowerPoint's stretched 2x2
+                        // solid-colour image shaped by a high-res stencil),
+                        // sampling the mask at base-image coordinates would
+                        // collapse it to a handful of samples and destroy the
+                        // shape. Upscale the base image instead.
                         let sw = smask_gray.width();
                         let sh = smask_gray.height();
+                        if sw > rgba_image.width() || sh > rgba_image.height() {
+                            let ow = sw.max(rgba_image.width());
+                            let oh = sh.max(rgba_image.height());
+                            rgba_image = image::imageops::resize(
+                                &rgba_image,
+                                ow,
+                                oh,
+                                image::imageops::FilterType::Triangle,
+                            );
+                        }
                         let iw = rgba_image.width();
                         let ih = rgba_image.height();
 
