@@ -6,6 +6,41 @@ use super::{
 use crate::content::GraphicsState;
 use tiny_skia::{FillRule, LineCap, LineJoin, Path, Pixmap, Stroke, Transform};
 
+
+/// A path that covers no area, so filling it can only paint nothing.
+///
+/// tiny-skia already declines these (`painter.rs`, `mask.rs`: "empty paths and
+/// horizontal/vertical lines cannot be filled"), but it declines them with a
+/// `log::warn!` per call, after the caller has paid for paint construction and
+/// (on the non-identity path) a full path clone and transform. CAD plotters
+/// emit degenerate fills in bulk — one AutoCAD General Arrangement sheet
+/// produced ~2,400 of these per render, each one a formatted log record — so
+/// the caller's own cheap check is worth having.
+///
+/// # Why the two thresholds differ
+///
+/// **Exactly zero is checked in USER space** and is safe under any transform:
+/// an affine map scales area by `|det|`, so a zero-area path is zero-area
+/// wherever it lands, and a scanline filler's coverage IS area. A *near*-zero
+/// user-space extent is NOT safe to skip — a 1/4096pt-wide path under a 4096x
+/// CTM is a full device pixel of ink — so the near-zero tolerance is applied
+/// only when the transform is the identity, where the path's own bounds are
+/// already device-space bounds. That is exactly the case tiny-skia itself
+/// tests, with the same `SCALAR_NEARLY_ZERO` (1/4096) tolerance.
+///
+/// Bounds are control-point bounds, which for curves can overstate the ink but
+/// never understate it, so a zero-extent bound really does mean zero ink.
+fn fill_covers_no_area(path: &Path, transform: Transform) -> bool {
+    let bounds = path.bounds();
+    let (w, h) = (bounds.width(), bounds.height());
+    if w == 0.0 || h == 0.0 {
+        return true;
+    }
+    // tiny-skia's `SCALAR_NEARLY_ZERO`, inlined: it is not public API.
+    const NEARLY_ZERO: f32 = 1.0 / 4096.0;
+    transform.is_identity() && (w.abs() < NEARLY_ZERO || h.abs() < NEARLY_ZERO)
+}
+
 /// Rasterizer for PDF path operations.
 pub struct PathRasterizer {
     // Could hold caches, state, etc.
@@ -27,6 +62,9 @@ impl PathRasterizer {
         gs: &GraphicsState,
         fill_rule: FillRule,
     ) {
+        if fill_covers_no_area(path, transform) {
+            return;
+        }
         let paint = create_fill_paint(gs, &gs.blend_mode);
         pixmap.fill_path(path, &paint, fill_rule, transform, None);
     }
@@ -82,6 +120,10 @@ impl PathRasterizer {
         fill_rule: FillRule,
         clip_mask: Option<&tiny_skia::Mask>,
     ) {
+        if fill_covers_no_area(path, transform) {
+            return;
+        }
+
         // NOTE: do NOT compute `path.clone().transform(transform)` here just for
         // logging. Vector figures (scatter / contour plots embedded as Form
         // XObjects) trigger this path tens of thousands of times per page, and
