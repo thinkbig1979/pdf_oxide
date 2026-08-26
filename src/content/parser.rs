@@ -64,8 +64,13 @@ pub fn set_max_ops_per_stream(limit: Option<usize>) -> Option<usize> {
 
 /// Current effective operator cap. Reads the override if set; otherwise
 /// returns [`MAX_OPERATORS`]. Internal hot-path helper.
+///
+/// `pub(crate)` so the document-level parsed-operator cache can key on it:
+/// parse output is a function of (bytes, cap), and the cap is a mutable
+/// process-global, so a cache keyed on the page alone would serve a
+/// stale-cap parse after [`set_max_ops_per_stream`] (FastPDF-mz7).
 #[inline]
-fn effective_max_operators() -> usize {
+pub(crate) fn effective_max_operators() -> usize {
     let override_val = MAX_OPERATORS_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed);
     if override_val == 0 {
         MAX_OPERATORS

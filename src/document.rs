@@ -123,6 +123,70 @@ const DEFAULT_OBJECT_CACHE_MAX_BYTES: usize = 64 * 1024 * 1024;
 /// Default maximum number of entries for the XObject span/image caches.
 const DEFAULT_XOBJECT_CACHE_MAX_ENTRIES: usize = 1024;
 
+/// Default byte budget for the parsed-page-operator cache (384 MiB).
+///
+/// # The budget is bounded from BELOW, which is the counter-intuitive part
+///
+/// [`PageOperatorsCache`] refuses any single entry larger than the whole
+/// budget, because admitting one would evict everything else and still not
+/// fit. So a budget *smaller* than one page's operators does not merely
+/// reduce the hit rate — it switches the cache off for that page entirely,
+/// silently, and every render re-parses. The documents that motivated this
+/// cache are exactly the documents with the largest operator lists, so a
+/// conservatively small number would disable it precisely where it is worth
+/// having, while looking like a working cache in every test.
+///
+/// # MEASURED, FastPDF-mz7, 2026-08-26
+///
+/// A 2384x4533pt AutoCAD general-arrangement sheet, at FastPDF's production
+/// operator cap of 20,000,000 (the crate default of 1,000,000 truncates it
+/// to a quarter of its real size and measures the wrong document):
+///
+/// | quantity | value |
+/// |---|---|
+/// | content stream | 48,645,546 bytes |
+/// | operators | 3,856,751 |
+/// | `capacity` before `shrink_to_fit` | 6,400,000 (244.1 MiB flat) |
+/// | `capacity` after | 3,856,751 (147.1 MiB flat) |
+/// | [`estimate_operators_size`] | 154,544,853 B = **147.4 MiB** |
+/// | parse | 1669 ms |
+///
+/// # Why 384 MiB and not less
+///
+/// Three floors, and the budget clears all of them:
+///
+/// 1. **147.4 MiB** — one such page, or it is refused and the cache no-ops.
+/// 2. **244.1 MiB** — the same page's allocation if `shrink_to_fit` were
+///    ever a no-op. The estimator counts live slots, so it would under-report
+///    by the 97 MiB of doubling slack; clearing this floor means a surprise
+///    there costs accuracy, not correctness.
+/// 3. **294.8 MiB — two such pages, and this is the floor that decided the
+///    number.** A viewer interleaves pages: the thumbnail panel renders
+///    every visible thumbnail on the same `DocumentThread` that serves
+///    main-view tiles, so the real sequence on a multi-page CAD set is
+///    tile(N) → thumbs(N-2..N+5) → tile(N). **A thumbnail parses the whole
+///    page however small it is drawn** — clipping bounds rasterization, not
+///    parsing — so a budget sized for one heavy page is evicted before every
+///    reuse. 256 MiB would have looked generous and done nothing, silently,
+///    on exactly the documents this cache exists for.
+///
+/// On ordinary documents an operator list is kilobytes to low megabytes, so
+/// the cache holds every page a session touches and never approaches this
+/// ceiling; the number is a worst-case bound, not a typical cost.
+///
+/// # Status
+///
+/// Ratified by the operator (FastPDF-mz7, 2026-08-26) against 256 MiB,
+/// 512 MiB, and making it configurable, on the trade as stated: FastPDF may
+/// retain up to 384 MiB of parsed drawing data for heavy CAD pages, to make
+/// every re-render and pan ~1.7 s faster, while ordinary documents cost
+/// kilobytes. A settings key was considered and deliberately deferred — do
+/// not add one without going back to that decision.
+///
+/// Like [`DEFAULT_OBJECT_CACHE_MAX_BYTES`] this is a soft guardrail rather
+/// than a hard ceiling — [`estimate_operators_size`] is an estimate.
+const DEFAULT_PAGE_OPERATORS_CACHE_MAX_BYTES: usize = 384 * 1024 * 1024;
+
 /// Heuristic multiplier for the forward-gap guard in the main
 /// assembly loop's compound newline predicate
 /// (`y_diff > 2.0 && gap > K * max(fs)`). Visual gap-sweep over
@@ -274,6 +338,229 @@ impl BoundedObjectCache {
             _ => 32,
         }
     }
+}
+
+/// Key for [`PageOperatorsCache`]: the page index plus the operator cap that
+/// was in force when the stream was parsed.
+///
+/// The cap belongs in the key because parse output is a function of
+/// (bytes, cap), not of bytes alone: `parse_content_stream` truncates at
+/// [`crate::content::parser::effective_max_operators`], which reads a
+/// process-global that [`crate::content::parser::set_max_ops_per_stream`]
+/// can change at any time. Keying on the page alone would hand a caller
+/// that had just raised the cap the shorter parse taken under the old one.
+type PageOperatorsKey = (usize, usize);
+
+/// Byte-bounded LRU cache of parsed page content streams.
+///
+/// # Why bytes and not entries
+///
+/// The sibling caches on [`PdfDocument`] bound themselves by entry count,
+/// which works because their entries are of broadly comparable size. Parsed
+/// operator lists are not: a text page holds a few thousand operators, while
+/// a CAD general-arrangement sheet holds millions. MEASURED on a 2384x4533pt
+/// AutoCAD drawing (FastPDF-mz7, 2026-08-26): 48.6 MB of content stream
+/// parses to 3,856,751 operators retaining 147.4 MiB, against a text page's
+/// kilobytes. An entry-count bound of 4 would therefore mean 4 KB on one
+/// document and 590 MiB on the other. Bounding on estimated bytes is the only
+/// bound that means the same thing on both.
+///
+/// # Eviction: LRU here, and the divergence from the sibling is deliberate
+///
+/// [`BoundedObjectCache`] beside it is FIFO, and its docblock says why —
+/// "the access pattern is predominantly insert-once-read-once, so recency is
+/// not a useful signal here". **That reasoning does not transfer to this
+/// cache, whose entire purpose is a repeat read.** The consumer interleaves
+/// pages: a viewer rendering a main-view tile for page N also renders
+/// thumbnails around N on the same document and the same thread, so the
+/// access pattern is N, then N-2..N+5, then N again. Under FIFO the pages
+/// requested between N's two uses would evict N precisely when it is about
+/// to be asked for a second time, which is the only time this cache pays.
+/// So: promote on read.
+///
+/// The byte-bounding, the `max_bytes` budget and the refuse-oversized rule
+/// ARE copied from the sibling, which is the part of its shape that does
+/// transfer.
+struct PageOperatorsCache {
+    map: HashMap<PageOperatorsKey, (std::sync::Arc<Vec<crate::content::Operator>>, usize)>,
+    /// Least-recently-used key at the front.
+    lru: std::collections::VecDeque<PageOperatorsKey>,
+    current_bytes: usize,
+    max_bytes: usize,
+}
+
+impl PageOperatorsCache {
+    fn new(max_bytes: usize) -> Self {
+        Self {
+            map: HashMap::new(),
+            lru: std::collections::VecDeque::new(),
+            current_bytes: 0,
+            max_bytes,
+        }
+    }
+
+    /// Fetch and promote to most-recently-used.
+    fn get(
+        &mut self,
+        key: &PageOperatorsKey,
+    ) -> Option<std::sync::Arc<Vec<crate::content::Operator>>> {
+        let hit = std::sync::Arc::clone(&self.map.get(key)?.0);
+        if let Some(pos) = self.lru.iter().position(|k| k == key) {
+            self.lru.remove(pos);
+        }
+        self.lru.push_back(*key);
+        Some(hit)
+    }
+
+    fn insert(
+        &mut self,
+        key: PageOperatorsKey,
+        value: std::sync::Arc<Vec<crate::content::Operator>>,
+        entry_bytes: usize,
+    ) {
+        // A page that alone exceeds the budget is never admitted: taking it
+        // would evict every other entry and still not fit, so the cache would
+        // end up holding nothing but the one page it cannot afford.
+        if entry_bytes > self.max_bytes {
+            log::debug!(
+                "page {} parses to ~{} MB of operators, over the {} MB cache budget — not cached, \
+                 every render of this page will re-parse it",
+                key.0,
+                entry_bytes / (1024 * 1024),
+                self.max_bytes / (1024 * 1024)
+            );
+            return;
+        }
+
+        // Drop any existing entry for this key first, so the eviction loop
+        // below never has to reason about evicting the key it is inserting.
+        if let Some((_, old_bytes)) = self.map.remove(&key) {
+            self.current_bytes = self.current_bytes.saturating_sub(old_bytes);
+            if let Some(pos) = self.lru.iter().position(|k| k == &key) {
+                self.lru.remove(pos);
+            }
+        }
+
+        while self.current_bytes + entry_bytes > self.max_bytes {
+            match self.lru.pop_front() {
+                Some(evicted) => {
+                    if let Some((_, bytes)) = self.map.remove(&evicted) {
+                        self.current_bytes = self.current_bytes.saturating_sub(bytes);
+                    }
+                },
+                None => break,
+            }
+        }
+
+        self.map.insert(key, (value, entry_bytes));
+        self.lru.push_back(key);
+        self.current_bytes += entry_bytes;
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.map.len()
+    }
+
+    #[cfg(test)]
+    fn current_bytes(&self) -> usize {
+        self.current_bytes
+    }
+}
+
+/// Rough estimate of a parsed operator list's heap footprint, in bytes.
+///
+/// Counts one `Operator` slot per element plus the heap each variant owns
+/// beyond that slot. Callers must `shrink_to_fit()` the vector first, which
+/// makes the slot count exact: `parse_content_stream` reserves
+/// `len / 20` capped at 100_000 and then grows by doubling without ever
+/// shrinking, so an un-shrunk 3.86 M-operator vector sits in a 6.4 M-operator
+/// allocation and carries ~100 MB of slack this function would not see.
+/// Variants whose
+/// payload is entirely inline — the path and text-positioning operators that
+/// dominate every real content stream — fall through to the catch-all and
+/// contribute only the slot already counted.
+///
+/// Deliberately an estimate, in the same spirit as
+/// [`BoundedObjectCache::estimate_size`]: it is a budget input, not an
+/// accounting figure. The exact walk is affordable because it runs once per
+/// parse — MEASURED on the 3.86 M-operator CAD sheet (FastPDF-mz7): 9 ms
+/// against a 1669 ms parse, 0.54%. Sampling was rejected for that price.
+///
+/// # Do not "simplify" this to `len * size_of::<Operator>()`
+///
+/// On that CAD sheet the per-variant heap came to 274,813 bytes against
+/// 154,270,040 bytes of slots — **0.18%**, because a general-arrangement
+/// drawing is almost entirely path operators that own nothing. It is
+/// therefore tempting to conclude the loop earns nothing and delete it.
+/// That conclusion is an artefact of the one document it was measured on:
+/// a text-heavy page is mostly `Tj`/`TJ`/`Tf`, whose owned bytes are
+/// unbounded by the operator count, and dropping the walk would make the
+/// budget blind to exactly the documents whose heap dominates their slots.
+fn estimate_operators_size(ops: &[crate::content::Operator]) -> usize {
+    use crate::content::{Operator, TextElement};
+
+    let mut total = std::mem::size_of_val(ops);
+    for op in ops {
+        total += match op {
+            Operator::Tj { text, .. } | Operator::Quote { text, .. } => text.capacity(),
+            Operator::DoubleQuote { text, .. } => text.capacity(),
+            Operator::TJ { array, .. } => {
+                array.capacity() * std::mem::size_of::<TextElement>()
+                    + array
+                        .iter()
+                        .map(|e| match e {
+                            TextElement::String(s) => s.capacity(),
+                            TextElement::Offset(_) => 0,
+                        })
+                        .sum::<usize>()
+            },
+            Operator::Tf { font: name, .. }
+            | Operator::SetFillColorSpace { name, .. }
+            | Operator::SetStrokeColorSpace { name, .. }
+            | Operator::Do { name, .. }
+            | Operator::PaintShading { name, .. }
+            | Operator::SetRenderingIntent { intent: name, .. }
+            | Operator::SetExtGState {
+                dict_name: name, ..
+            }
+            | Operator::BeginMarkedContent { tag: name, .. } => name.capacity(),
+            Operator::SetFillColor { components, .. }
+            | Operator::SetStrokeColor { components, .. } => {
+                components.capacity() * std::mem::size_of::<f32>()
+            },
+            Operator::SetFillColorN {
+                components, name, ..
+            }
+            | Operator::SetStrokeColorN {
+                components, name, ..
+            } => {
+                components.capacity() * std::mem::size_of::<f32>()
+                    + name.as_ref().map_or(0, |n| n.capacity() + 32)
+            },
+            Operator::SetDash { array, .. } => array.capacity() * std::mem::size_of::<f32>(),
+            Operator::InlineImage { dict, data, .. } => {
+                data.capacity()
+                    + dict
+                        .iter()
+                        .map(|(k, v)| k.len() + 32 + BoundedObjectCache::estimate_size(v))
+                        .sum::<usize>()
+            },
+            Operator::BeginMarkedContentDict {
+                tag, properties, ..
+            } => tag.capacity() + BoundedObjectCache::estimate_size(properties),
+            Operator::Other { name, operands, .. } => {
+                name.capacity()
+                    + operands.capacity() * std::mem::size_of::<Object>()
+                    + operands
+                        .iter()
+                        .map(BoundedObjectCache::estimate_size)
+                        .sum::<usize>()
+            },
+            _ => 0,
+        };
+    }
+    total
 }
 
 // Per-thread resolving stack and recursion depth for load_object.
@@ -469,6 +756,23 @@ pub struct PdfDocument {
     pub(crate) erase_regions: Mutex<HashMap<usize, Vec<crate::geometry::Rect>>>,
     /// LRU cache of decompressed page content streams, keyed by page index.
     page_content_cache: Mutex<BoundedEntryCache<usize, std::sync::Arc<Vec<u8>>>>,
+    /// Byte-bounded LRU cache of PARSED page content streams — the operator
+    /// lists [`Self::cached_page_operators`] hands out.
+    ///
+    /// Sits beside `page_content_cache` rather than replacing it because the
+    /// two serve different consumers: extraction wants bytes, rendering wants
+    /// operators, and a render is the only caller that pays the parse.
+    ///
+    /// **Never invalidated, because a loaded page's content cannot change.**
+    /// OBSERVED 2026-08-26 (FastPDF-mz7): `PdfDocument` exposes no
+    /// `pub fn ...(&mut self)` at all, so no public API can rewrite a page's
+    /// content stream after load. The one `&self` write path that touches
+    /// page content semantically — `erase_region` / `clear_erase_regions` —
+    /// records overlay rectangles and clears `page_spans_cache` and
+    /// `search_index`, and deliberately leaves `page_content_cache` alone for
+    /// the same reason this cache needs no invalidation: the bytes are
+    /// immutable, only their interpretation changes.
+    page_operators_cache: Mutex<PageOperatorsCache>,
     /// LRU cache of postprocessed [`TextSpan`]s per page. `to_markdown`/`to_html`
     /// reach `extract_spans` twice per page — once directly, once via
     /// `extract_page_tables` → `extract_words` → `page_reading_order`; this serves
@@ -1114,6 +1418,9 @@ impl PdfDocument {
             )),
             erase_regions: Mutex::new(HashMap::new()),
             page_content_cache: Mutex::new(BoundedEntryCache::new(64)),
+            page_operators_cache: Mutex::new(PageOperatorsCache::new(
+                DEFAULT_PAGE_OPERATORS_CACHE_MAX_BYTES,
+            )),
             page_spans_cache: Mutex::new(BoundedEntryCache::new(8)),
             search_index: Mutex::new(HashMap::new()),
             page_chars_cache: Mutex::new(BoundedEntryCache::new(8)),
@@ -17266,6 +17573,76 @@ impl PdfDocument {
         Ok((*self.cached_page_content(page_index)?).clone())
     }
 
+    /// Parsed operators for a page's TOP-LEVEL content stream, memoized on
+    /// the document.
+    ///
+    /// # Why this exists
+    ///
+    /// `PageRenderer` is constructed fresh for every render call
+    /// (`rendering/mod.rs`, in `render_page`, which both `render_page_fit`
+    /// and `render_page_fit_region` tail-call), so a cache held by the
+    /// renderer would never survive to be read. The document outlives every
+    /// render of it, so the memo belongs here.
+    ///
+    /// MEASURED (FastPDF-mz7, 2026-08-26): on a 2384x4533pt AutoCAD
+    /// general-arrangement sheet, re-parsing 48.6 MB of content stream into
+    /// 3,856,751 operators cost 1669 ms at opt-level 3, and was paid again on
+    /// every pan and every zoom step of an ~8-9 s render. (FastPDF-uc8 put it
+    /// at ~2.5 s under the crate's default release profile, which adds LTO;
+    /// both are a large fraction of a ~6.4 s output-size-independent floor.)
+    ///
+    /// # Only the page's own stream
+    ///
+    /// The key is the page index, so ONLY the top-level page content stream
+    /// may be stored under it. The renderer parses several other kinds of
+    /// stream — Type 3 glyph charprocs, Form XObjects, tiling-pattern cells —
+    /// and those call [`crate::content::parse_content_stream`] directly and
+    /// must keep doing so. Routing one of them through here would return the
+    /// whole page's operators for a single glyph box.
+    ///
+    /// # Bounding
+    ///
+    /// Entries are bounded by estimated bytes, not by count, and a page whose
+    /// operators alone exceed the budget is not cached at all — see
+    /// [`PageOperatorsCache`] and [`DEFAULT_PAGE_OPERATORS_CACHE_MAX_BYTES`].
+    pub(crate) fn cached_page_operators(
+        &self,
+        page_index: usize,
+    ) -> Result<std::sync::Arc<Vec<crate::content::Operator>>> {
+        let key: PageOperatorsKey = (page_index, crate::content::parser::effective_max_operators());
+
+        // Scoped so the guard is released before the parse below. Parsing
+        // cannot re-enter this cache, but `execute_operators` — which runs
+        // against what this returns — calls back into `load_object` and
+        // `decode_stream_with_encryption`, so holding a document lock across
+        // work of that shape is a habit worth not forming.
+        {
+            let mut cache = self.page_operators_cache.lock_or_recover();
+            if let Some(operators) = cache.get(&key) {
+                return Ok(operators);
+            }
+        }
+
+        let content = self.cached_page_content(page_index)?;
+        let mut operators = crate::content::parse_content_stream(&content)?;
+        // `parse_content_stream` grows by doubling and never shrinks.
+        // MEASURED on the CAD sheet above: capacity 6,400,000 against
+        // 3,856,751 live operators, so 97 MiB of pure slack that would
+        // otherwise be retained for the document's lifetime. The call itself
+        // measured 0 ms there.
+        operators.shrink_to_fit();
+        let entry_bytes = estimate_operators_size(&operators);
+        let operators = std::sync::Arc::new(operators);
+
+        self.page_operators_cache.lock_or_recover().insert(
+            key,
+            std::sync::Arc::clone(&operators),
+            entry_bytes,
+        );
+
+        Ok(operators)
+    }
+
     /// Shared, cached content-stream bytes for a page — the same data
     /// [`Self::get_page_content_data`] returns, minus the copy. Extraction
     /// only ever reads the bytes, and a single `extract_words` page touches
@@ -25021,6 +25398,253 @@ mod tests {
         let doc = PdfDocument::from_bytes(pdf).unwrap();
         let data = doc.get_page_content_data(0).unwrap();
         assert!(data.is_empty()); // No contents = empty
+    }
+
+    // ========================================================================
+    // FastPDF-mz7: parsed-page-operator cache
+    // ========================================================================
+
+    /// Build a `page_count`-page PDF where every page carries its own
+    /// distinct, non-empty content stream.
+    ///
+    /// [`build_multi_page_pdf`] cannot serve these tests: it emits pages with
+    /// no `/Contents` at all, and `cached_page_content` short-circuits an
+    /// absent `/Contents` to an empty `Arc` before the cache is ever reached,
+    /// so every page would look identical and no cache identity would be
+    /// exercised.
+    fn build_multi_page_pdf_with_content(page_count: usize) -> Vec<u8> {
+        let mut pdf = b"%PDF-1.4\n".to_vec();
+        let mut offsets: Vec<usize> = Vec::new();
+
+        offsets.push(pdf.len());
+        pdf.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+
+        offsets.push(pdf.len());
+        let kids_str: String = (0..page_count)
+            .map(|i| format!("{} 0 R", i + 3))
+            .collect::<Vec<_>>()
+            .join(" ");
+        pdf.extend_from_slice(
+            format!(
+                "2 0 obj\n<< /Type /Pages /Kids [{}] /Count {} >>\nendobj\n",
+                kids_str, page_count
+            )
+            .as_bytes(),
+        );
+
+        for i in 0..page_count {
+            offsets.push(pdf.len());
+            pdf.extend_from_slice(
+                format!(
+                    "{} 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
+                     /Contents {} 0 R >>\nendobj\n",
+                    i + 3,
+                    i + 3 + page_count
+                )
+                .as_bytes(),
+            );
+        }
+
+        // One stream per page, and the operand differs per page so a
+        // cross-page key collision surfaces as wrong CONTENT, not merely as a
+        // shared allocation.
+        for i in 0..page_count {
+            offsets.push(pdf.len());
+            let content = format!("{} 0 0 {} 0 0 cm\n", i + 1, i + 1);
+            pdf.extend_from_slice(
+                format!(
+                    "{} 0 obj\n<< /Length {} >>\nstream\n{}endstream\nendobj\n",
+                    i + 3 + page_count,
+                    content.len(),
+                    content
+                )
+                .as_bytes(),
+            );
+        }
+
+        let xref_off = pdf.len();
+        let total_objs = offsets.len() + 1;
+        pdf.extend_from_slice(format!("xref\n0 {}\n", total_objs).as_bytes());
+        pdf.extend_from_slice(b"0000000000 65535 f \n");
+        for off in &offsets {
+            pdf.extend_from_slice(format!("{:010} 00000 n \n", off).as_bytes());
+        }
+        pdf.extend_from_slice(
+            format!(
+                "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{}\n%%EOF\n",
+                total_objs, xref_off
+            )
+            .as_bytes(),
+        );
+
+        pdf
+    }
+
+    /// `n` operators of the cheapest possible kind, for cache-level tests
+    /// where the byte figure matters and the operators themselves do not.
+    fn fake_operators(n: usize) -> std::sync::Arc<Vec<crate::content::Operator>> {
+        std::sync::Arc::new(vec![crate::content::Operator::TStar; n])
+    }
+
+    /// HIT side: a repeat request returns the same allocation. Only a cache
+    /// can do that — a re-parse yields an equal but distinct `Vec`.
+    #[test]
+    fn page_operators_are_parsed_once_per_page() {
+        let doc = PdfDocument::from_bytes(build_multi_page_pdf_with_content(2)).unwrap();
+        let first = doc.cached_page_operators(0).unwrap();
+        let second = doc.cached_page_operators(0).unwrap();
+        assert!(
+            !first.is_empty(),
+            "fixture page 0 must parse to a non-empty operator list, or identity proves nothing"
+        );
+        assert!(
+            std::sync::Arc::ptr_eq(&first, &second),
+            "a repeat request must return the cached Arc, not re-parse the content stream"
+        );
+    }
+
+    /// MISS side: distinct pages are distinct entries. The hit test above
+    /// would pass just as well against a cache that returned one page's
+    /// operators for every page.
+    #[test]
+    fn page_operators_are_not_shared_between_pages() {
+        let doc = PdfDocument::from_bytes(build_multi_page_pdf_with_content(2)).unwrap();
+        let page0 = doc.cached_page_operators(0).unwrap();
+        let page1 = doc.cached_page_operators(1).unwrap();
+        assert_ne!(
+            *page0, *page1,
+            "the fixture's two pages must differ, or pointer inequality proves nothing"
+        );
+        assert!(
+            !std::sync::Arc::ptr_eq(&page0, &page1),
+            "distinct pages must not share a cache entry"
+        );
+    }
+
+    /// INTERLEAVED side: page N survives a render of some other page.
+    ///
+    /// This is the arm the motivating document cannot exercise — it has one
+    /// page, so it hits 100% whatever the cache does. The real consumer
+    /// interleaves: a viewer rendering a tile for page N also renders
+    /// thumbnails around N on the same document, giving N, other, N.
+    #[test]
+    fn page_operators_survive_an_interleaved_page() {
+        let doc = PdfDocument::from_bytes(build_multi_page_pdf_with_content(3)).unwrap();
+        let first = doc.cached_page_operators(0).unwrap();
+        let _interleaved = doc.cached_page_operators(1).unwrap();
+        let _interleaved = doc.cached_page_operators(2).unwrap();
+        let refetched = doc.cached_page_operators(0).unwrap();
+        assert!(
+            std::sync::Arc::ptr_eq(&first, &refetched),
+            "page 0 must still be cached after other pages were requested"
+        );
+    }
+
+    /// The bound is on BYTES, not entries: three entries that fit an
+    /// entry-count bound of three do not fit a byte budget that holds two.
+    #[test]
+    fn page_operators_cache_evicts_by_bytes_not_entries() {
+        let entry = fake_operators(10);
+        let entry_bytes = estimate_operators_size(&entry);
+        // Room for two such entries, not three.
+        let mut cache = PageOperatorsCache::new(entry_bytes * 2 + entry_bytes / 2);
+
+        cache.insert((0, 0), std::sync::Arc::clone(&entry), entry_bytes);
+        cache.insert((1, 0), fake_operators(10), entry_bytes);
+        assert_eq!(cache.len(), 2, "two entries must fit");
+
+        cache.insert((2, 0), fake_operators(10), entry_bytes);
+        assert_eq!(cache.len(), 2, "the third must have evicted the first");
+        assert!(
+            cache.get(&(0, 0)).is_none(),
+            "the least-recently-used entry is the one that goes"
+        );
+        assert!(cache.get(&(1, 0)).is_some());
+        assert!(cache.get(&(2, 0)).is_some());
+        assert!(cache.current_bytes() <= cache.max_bytes);
+    }
+
+    /// Eviction is LRU, not FIFO: touching the oldest entry saves it.
+    ///
+    /// This is what makes the interleaved access pattern survivable whenever
+    /// the budget holds more than one page. With FIFO, page N would be
+    /// evicted by the pages requested between its two uses.
+    #[test]
+    fn page_operators_cache_evicts_least_recently_used_not_oldest() {
+        let entry_bytes = estimate_operators_size(&fake_operators(10));
+        let mut cache = PageOperatorsCache::new(entry_bytes * 2 + entry_bytes / 2);
+
+        cache.insert((0, 0), fake_operators(10), entry_bytes);
+        cache.insert((1, 0), fake_operators(10), entry_bytes);
+        // Touch the oldest, making the SECOND entry the least recently used.
+        assert!(cache.get(&(0, 0)).is_some());
+        cache.insert((2, 0), fake_operators(10), entry_bytes);
+
+        assert!(
+            cache.get(&(0, 0)).is_some(),
+            "the recently-touched entry must survive; FIFO would have dropped it"
+        );
+        assert!(cache.get(&(1, 0)).is_none(), "the least recently used entry is the one evicted");
+    }
+
+    /// A page bigger than the whole budget is not cached at all — admitting
+    /// it would evict every other entry and still not fit.
+    #[test]
+    fn page_operators_cache_refuses_an_entry_larger_than_its_budget() {
+        let small = fake_operators(4);
+        let small_bytes = estimate_operators_size(&small);
+        let mut cache = PageOperatorsCache::new(small_bytes * 2);
+        cache.insert((0, 0), small, small_bytes);
+
+        let huge = fake_operators(1000);
+        let huge_bytes = estimate_operators_size(&huge);
+        assert!(huge_bytes > cache.max_bytes, "fixture must exceed the budget");
+        cache.insert((1, 0), huge, huge_bytes);
+
+        assert!(cache.get(&(1, 0)).is_none(), "the oversized entry must not be admitted");
+        assert!(
+            cache.get(&(0, 0)).is_some(),
+            "and it must not have evicted the entries that did fit"
+        );
+    }
+
+    /// The operator cap is part of the key. Parse output is a function of
+    /// (bytes, cap), so a lookup made under a different cap must miss rather
+    /// than serve a parse truncated at the old one.
+    #[test]
+    fn page_operators_cache_keys_on_the_operator_cap() {
+        let entry = fake_operators(10);
+        let entry_bytes = estimate_operators_size(&entry);
+        let mut cache = PageOperatorsCache::new(entry_bytes * 8);
+
+        cache.insert((0, 1_000_000), entry, entry_bytes);
+        assert!(cache.get(&(0, 1_000_000)).is_some(), "same page, same cap must hit");
+        assert!(
+            cache.get(&(0, 10)).is_none(),
+            "same page under a different operator cap must miss"
+        );
+    }
+
+    /// The estimator must actually count per-variant heap, not just slots —
+    /// otherwise the byte budget is a slot budget wearing a disguise.
+    #[test]
+    fn operator_size_estimate_counts_heap_beyond_the_slot() {
+        use crate::content::Operator;
+
+        let bare = vec![Operator::TStar];
+        let with_heap = vec![Operator::Tj {
+            text: vec![b'x'; 4096],
+        }];
+
+        assert_eq!(
+            estimate_operators_size(&bare),
+            std::mem::size_of::<Operator>(),
+            "an all-inline operator costs exactly its slot"
+        );
+        assert!(
+            estimate_operators_size(&with_heap) >= 4096,
+            "a text-carrying operator must count its owned bytes"
+        );
     }
 
     // ========================================================================

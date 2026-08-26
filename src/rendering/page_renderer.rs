@@ -679,16 +679,17 @@ impl PageRenderer {
             self.cmyk_sidecar = Some(CmykSidecar::new(out_w, out_h, spot_names));
         }
 
-        // Get page content stream
-        let content_data = doc.get_page_content_data(page_num)?;
-
-        // Parse content stream
-        let operators = match parse_content_stream(&content_data) {
-            Ok(ops) => ops,
-            Err(e) => {
-                return Err(e);
-            },
-        };
+        // Parsed operators for the page's top-level content stream, memoized
+        // on the document (FastPDF-mz7). This is the ONLY site that may use
+        // the page-keyed cache: the Type 3 charproc, Form XObject and
+        // tiling-pattern parses below call `parse_content_stream` directly
+        // because they are not the page's own stream.
+        //
+        // This also retires a full copy of the content stream per render —
+        // `get_page_content_data` clones the cached bytes, 48.6 MB of them on
+        // the drawing that motivated the bead — because neither the hit path
+        // nor the miss path needs the bytes out here any more.
+        let operators = doc.cached_page_operators(page_num)?;
 
         // Execute operators
         self.execute_operators(&mut pixmap, transform, &operators, doc, page_num, &resources)?;
