@@ -174,6 +174,24 @@ pub struct RenderOptions {
     /// exact (issue #480). Not part of the public API; set via
     /// `render_page_fit` only.
     pub(crate) scale_override: Option<f32>,
+    /// Rasterize only this sub-rectangle of the page, as `(x, y, w, h)` in
+    /// the pixels of the FULL-page raster this scale would produce, top-left
+    /// origin.
+    ///
+    /// Set via [`crate::rendering::render_page_fit_region`] only. When
+    /// `Some`, the pixmap is allocated at `w` x `h` instead of the full page
+    /// size and the base transform is post-translated by `(-x, -y)`, so the
+    /// renderer executes the page's operators straight into crop-local pixel
+    /// space. Everything outside the crop is never allocated and never
+    /// touched — which is the point: it is what makes a high-zoom viewport
+    /// affordable, where `render_page_region` (full render, then crop) is
+    /// not.
+    ///
+    /// The output is byte-identical to the same sub-rectangle of the
+    /// full-page render at the same scale, because the only change is a
+    /// translation in destination space. Pinned by
+    /// `crop_matches_the_same_window_of_the_full_render`.
+    pub(crate) crop_px: Option<(u32, u32, u32, u32)>,
 }
 
 impl Default for RenderOptions {
@@ -186,6 +204,7 @@ impl Default for RenderOptions {
             jpeg_quality: 85,
             excluded_layers: HashSet::new(),
             scale_override: None,
+            crop_px: None,
         }
     }
 }
@@ -527,8 +546,29 @@ impl PageRenderer {
             ((page_w * scale).ceil() as u32, (page_h * scale).ceil() as u32)
         };
 
+        // A clipped render (`crop_px`) allocates the pixmap at the crop size
+        // rather than the page size, and shifts the base transform below so
+        // the page's operators execute straight into crop-local pixel space.
+        // `width`/`height` stay the FULL-page raster dimensions throughout —
+        // they are what the crop is expressed against — while `out_w`/`out_h`
+        // are what is actually allocated, painted and returned.
+        //
+        // The crop is clamped to the page raster rather than refused: a
+        // caller tiling a viewport routinely asks for a tile-aligned window
+        // whose last column or row runs past the page edge, and a clamp is
+        // the same answer the full-page path gives that caller (it simply has
+        // no pixels there).
+        let (crop_x, crop_y, out_w, out_h) = match self.options.crop_px {
+            Some((x, y, w, h)) => {
+                let x = x.min(width.saturating_sub(1));
+                let y = y.min(height.saturating_sub(1));
+                (x, y, w.min(width - x).max(1), h.min(height - y).max(1))
+            },
+            None => (0, 0, width, height),
+        };
+
         // Create pixmap
-        let mut pixmap = Pixmap::new(width, height)
+        let mut pixmap = Pixmap::new(out_w, out_h)
             .ok_or_else(|| Error::InvalidPdf("Failed to create pixmap".to_string()))?;
 
         // Fill background
@@ -579,6 +619,15 @@ impl PageRenderer {
                     .post_translate(0.0, page_h * scale)
             },
         };
+        // Crop-local destination space. `post_translate` composes LAST, in
+        // destination (pixel) space, so this is exactly the window shift and
+        // nothing about the page's own geometry moves — which is why a
+        // cropped render is byte-identical to that window of the full one.
+        let transform = if (crop_x, crop_y) == (0, 0) {
+            transform
+        } else {
+            transform.post_translate(-(crop_x as f32), -(crop_y as f32))
+        };
 
         // Get page resources
         let resources = doc.get_page_resources(page_num)?;
@@ -627,7 +676,7 @@ impl PageRenderer {
             && page_declares_transparency_or_overprint(doc, &resources);
         if needs_cmyk_sidecar {
             let spot_names = sidecar_mod::discover_page_spot_inks(doc, page_num);
-            self.cmyk_sidecar = Some(CmykSidecar::new(width, height, spot_names));
+            self.cmyk_sidecar = Some(CmykSidecar::new(out_w, out_h, spot_names));
         }
 
         // Get page content stream
@@ -658,8 +707,8 @@ impl PageRenderer {
 
         Ok(RenderedImage {
             data,
-            width,
-            height,
+            width: out_w,
+            height: out_h,
             format: self.options.format,
         })
     }

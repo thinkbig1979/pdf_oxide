@@ -4834,6 +4834,7 @@ pub extern "C" fn pdf_render_page_with_options(
             jpeg_quality: jpeg_quality as u8,
             excluded_layers: std::collections::HashSet::new(),
             scale_override: None,
+            crop_px: None,
         };
         match rendering::render_page(d, page_index as usize, &opts) {
             Ok(img) => {
@@ -4938,6 +4939,7 @@ pub extern "C" fn pdf_render_page_with_options_ex(
             jpeg_quality: jpeg_quality as u8,
             excluded_layers: layers,
             scale_override: None,
+            crop_px: None,
         };
         match rendering::render_page(d, page_index as usize, &opts) {
             Ok(img) => {
