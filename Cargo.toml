@@ -505,6 +505,30 @@ barcodes = ["dep:qrcode", "dep:barcoders"]
 # Parallel page extraction via rayon
 parallel = ["dep:rayon"]
 
+# Carried patch (FastPDF-jj5). One `cargo test` run over this crate's 341 test
+# and 25 example targets cost **128 GB** of `target/`: every one of them
+# statically links the whole dependency tree with FULL debug info, because
+# nothing here declares a `[profile.dev]` and cargo's default is
+# `debug = true`. That filled the operator's home partition to 1.1 GB free and
+# took the machine out.
+#
+# MEASURED: the same lib-test run under `line-tables-only` is 1.9 GB. A
+# backtrace keeps its file and line numbers, which is what a test failure
+# needs; what goes is the variable and type DWARF a debugger would want.
+#
+# `dev` rather than `test`, deliberately: `test` INHERITS from `dev`, so this
+# one key covers the test targets AND the 25 examples, which are part of the
+# 128 GB and are not test targets. Setting `[profile.test]` alone would leave
+# the examples at full debug info.
+#
+# Cargo IGNORES `[profile.*]` in a non-root package, so this reaches only
+# people building pdf_oxide directly and cannot affect a downstream consumer.
+# FastPDF, which vendors this crate through a `[patch.crates-io]` git pin,
+# already sets exactly this key in its own workspace root and is unaffected
+# either way.
+[profile.dev]
+debug = "line-tables-only"
+
 [profile.release]
 opt-level = 3
 lto = true
