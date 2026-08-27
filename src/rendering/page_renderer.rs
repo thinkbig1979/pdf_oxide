@@ -852,7 +852,21 @@ impl PageRenderer {
         let mut in_text_object = false;
         let mut current_path = PathBuilder::new();
         let mut pending_clip: Option<(tiny_skia::Path, tiny_skia::FillRule)> = None;
-        let mut clip_stack: Vec<Option<tiny_skia::Mask>> = vec![None]; // Start with no clip at depth 0
+        // The clip is reference-counted, not deep-copied (FastPDF-fdn). `q`
+        // pushes a second handle to the SAME mask and `apply_pending_clip` --
+        // the only writer -- copies through `Arc::make_mut`, so the cost is
+        // one copy per `W n` that still shares its mask instead of one per
+        // `q`.
+        //
+        // MEASURED on a 2384x4533pt AutoCAD general-arrangement plot, which
+        // carries 36,706 `q` against 250 `W`: 36,456 of those `q` execute
+        // with a live clip, and a `Mask` owns one byte per pixel of the
+        // render surface. At a 3840x2160 crop that was 302 GB of memcpy --
+        // 26.5 s of a 30.4 s render. With the `Arc` the same render is
+        // 2.4 s and byte-identical, and cost stops scaling with output area
+        // (1.9 s at 800x450 against 2.4 s at 3840x2160, where before it was
+        // 3.4 s against 30.4 s).
+        let mut clip_stack: Vec<Option<std::sync::Arc<tiny_skia::Mask>>> = vec![None];
 
         // WS1.5b — text-clip accumulator (ISO 32000-1 §9.3.6 / Table 106,
         // `Tr` modes 4–7). Text render modes ≥4 add the union of their glyph
@@ -1687,7 +1701,7 @@ impl PageRenderer {
                             base_transform,
                             &gs_stack,
                         );
-                        let clip = clip_stack.last().and_then(|c| c.as_ref());
+                        let clip = clip_stack.last().and_then(|c| c.as_deref());
                         if let Some(path) = current_path.finish() {
                             let gs_clone = gs_stack.current().clone();
                             // Stroke side mirrors the path-fill routing —
@@ -1805,7 +1819,7 @@ impl PageRenderer {
                             base_transform,
                             &gs_stack,
                         );
-                        let clip = clip_stack.last().and_then(|c| c.as_ref());
+                        let clip = clip_stack.last().and_then(|c| c.as_deref());
                         if let Some(path) = current_path.finish() {
                             let gs_clone = gs_stack.current().clone();
                             // Resolve the active fill colour through the
@@ -1955,7 +1969,7 @@ impl PageRenderer {
                             base_transform,
                             &gs_stack,
                         );
-                        let clip = clip_stack.last().and_then(|c| c.as_ref());
+                        let clip = clip_stack.last().and_then(|c| c.as_deref());
                         // ISO 32000-1 §8.5.3.1 Table 60: `b` and `b*` close
                         // the path before fill+stroke. The parser does not
                         // decompose them (unlike `s`, which is emitted as
@@ -2157,7 +2171,7 @@ impl PageRenderer {
                             base_transform,
                             &gs_stack,
                         );
-                        let clip = clip_stack.last().and_then(|c| c.as_ref());
+                        let clip = clip_stack.last().and_then(|c| c.as_deref());
                         if let Some(path) = current_path.finish() {
                             let gs_clone = gs_stack.current().clone();
                             let transform = combine_transforms(base_transform, &gs_clone.ctm);
@@ -2385,8 +2399,10 @@ impl PageRenderer {
                             // clip — never widened past it.
                             if let Some(slot) = clip_stack.last_mut() {
                                 let existing = slot.take();
-                                *slot =
-                                    Some(intersect_with_inherited(text_mask, existing.as_ref()));
+                                *slot = Some(std::sync::Arc::new(intersect_with_inherited(
+                                    text_mask,
+                                    existing.as_deref(),
+                                )));
                             }
                         }
                     }
@@ -2445,7 +2461,7 @@ impl PageRenderer {
                         }
                         let gs = gs_stack.current();
                         let advance = if excluded_layer_depth == 0 {
-                            let clip = clip_stack.last().and_then(|c| c.as_ref());
+                            let clip = clip_stack.last().and_then(|c| c.as_deref());
                             let transform = combine_transforms(base_transform, &gs.ctm);
                             // WS1.5b — modes 4–7 add this show's glyph
                             // outlines to the text clip path (applied at ET).
@@ -2590,7 +2606,7 @@ impl PageRenderer {
 
                         let gs = gs_stack.current();
                         let advance = if excluded_layer_depth == 0 {
-                            let clip = clip_stack.last().and_then(|c| c.as_ref());
+                            let clip = clip_stack.last().and_then(|c| c.as_deref());
                             let transform = combine_transforms(base_transform, &gs.ctm);
                             log::debug!(
                                 "' (Quote): rendering text at Tm=[{}, {}, {}, {}, {}, {}]",
@@ -2720,7 +2736,7 @@ impl PageRenderer {
                         }
                         let gs = gs_stack.current();
                         let advance = if excluded_layer_depth == 0 {
-                            let clip = clip_stack.last().and_then(|c| c.as_ref());
+                            let clip = clip_stack.last().and_then(|c| c.as_deref());
                             let transform = combine_transforms(base_transform, &gs.ctm);
                             log::debug!(
                                 "TJ: rendering array at Tm=[{}, {}, {}, {}, {}, {}]",
@@ -2870,7 +2886,7 @@ impl PageRenderer {
 
                         let gs = gs_stack.current();
                         let advance = if excluded_layer_depth == 0 {
-                            let clip = clip_stack.last().and_then(|c| c.as_ref());
+                            let clip = clip_stack.last().and_then(|c| c.as_deref());
                             let transform = combine_transforms(base_transform, &gs.ctm);
                             log::debug!(
                                 "\" (DoubleQuote): rendering text at Tm=[{}, {}, {}, {}, {}, {}]",
@@ -2980,7 +2996,7 @@ impl PageRenderer {
                     if excluded_layer_depth == 0 {
                         let gs_clone = gs_stack.current().clone();
                         let transform = combine_transforms(base_transform, &gs_clone.ctm);
-                        let clip = clip_stack.last().and_then(|c| c.as_ref());
+                        let clip = clip_stack.last().and_then(|c| c.as_deref());
                         log::debug!("Do: rendering XObject '{}'", name);
                         // §11.4.7 + §11.7.4 + §11.4 cycle: the entire
                         // XObject paint (Form or Image) sits inside the
@@ -3098,7 +3114,7 @@ impl PageRenderer {
                     if excluded_layer_depth == 0 {
                         let gs_clone = gs_stack.current().clone();
                         let transform = combine_transforms(base_transform, &gs_clone.ctm);
-                        let clip = clip_stack.last().and_then(|c| c.as_ref());
+                        let clip = clip_stack.last().and_then(|c| c.as_deref());
                         let expanded =
                             crate::extractors::images::expand_inline_image_dict((**dict).clone());
                         let is_image_mask = expanded
@@ -3254,7 +3270,7 @@ impl PageRenderer {
                             }
                         }
                         let transform = combine_transforms(base_transform, &gs_clone.ctm);
-                        let clip = clip_stack.last().and_then(|c| c.as_ref());
+                        let clip = clip_stack.last().and_then(|c| c.as_deref());
                         // §11.4.7 + §11.7.4 + §11.4 cycle: shading is
                         // a fill-side paint, so the snapshot/apply
                         // cadence mirrors the path-Fill arm. The
@@ -10107,7 +10123,7 @@ fn compose_overprint_channel(
 
 fn apply_pending_clip(
     pending_clip: &mut Option<(tiny_skia::Path, tiny_skia::FillRule)>,
-    clip_stack: &mut Vec<Option<tiny_skia::Mask>>,
+    clip_stack: &mut Vec<Option<std::sync::Arc<tiny_skia::Mask>>>,
     pixmap: &Pixmap,
     base_transform: Transform,
     gs_stack: &GraphicsStateStack,
@@ -10128,17 +10144,28 @@ fn apply_pending_clip(
             // library's rounded `(a*b)/255` premultiply — replacing the
             // previous code path which additionally cloned the current mask
             // (a full page-sized memcpy) before running an equivalent scalar
-            // multiply loop. The clone was redundant: every `q` already pushes
-            // a cloned mask onto `clip_stack`, so the top-of-stack mask at the
-            // current depth is already this scope's private copy and may be
-            // mutated in place.
+            // multiply loop.
+            //
+            // This is the ONLY writer of a clip mask, so `Arc::make_mut` is
+            // where the copy-on-write happens (FastPDF-fdn). It copies only
+            // when an enclosing `q` scope still holds the same mask; where
+            // the handle is already unique -- a second clip inside one scope
+            // -- it mutates in place, exactly as the previous code did.
+            //
+            // Scope isolation is what makes `make_mut` load-bearing rather
+            // than cosmetic: a plain in-place mutation here would narrow the
+            // mask the PARENT scope is holding, and content painted after
+            // the matching `Q` would be clipped by a clip that no longer
+            // applies. Guarded by
+            // `nested_clip_does_not_leak_into_the_enclosing_scope` below.
             Some(existing_mask) => {
-                existing_mask.intersect_path(&path, fill_rule, true, transform);
+                std::sync::Arc::make_mut(existing_mask)
+                    .intersect_path(&path, fill_rule, true, transform);
             },
             None => {
                 let mut new_mask = tiny_skia::Mask::new(pixmap.width(), pixmap.height()).unwrap();
                 new_mask.fill_path(&path, fill_rule, true, transform);
-                *slot = Some(new_mask);
+                *slot = Some(std::sync::Arc::new(new_mask));
             },
         }
     }
@@ -11088,7 +11115,7 @@ mod tests {
         // with no pending clip. Only the first call should materialize.
         const K: usize = 100;
         APC_MATERIALIZED.store(0, Ordering::Relaxed);
-        let mut clip_stack: Vec<Option<tiny_skia::Mask>> = vec![None];
+        let mut clip_stack: Vec<Option<std::sync::Arc<tiny_skia::Mask>>> = vec![None];
         let mut pending: Option<(tiny_skia::Path, FillRule)> =
             Some((make_clip_path(), FillRule::Winding));
         for _ in 0..K {
@@ -11105,7 +11132,7 @@ mod tests {
         // Materialization count must equal N, not K*N.
         const N: usize = 5;
         APC_MATERIALIZED.store(0, Ordering::Relaxed);
-        let mut clip_stack: Vec<Option<tiny_skia::Mask>> = vec![None];
+        let mut clip_stack: Vec<Option<std::sync::Arc<tiny_skia::Mask>>> = vec![None];
         for _ in 0..N {
             let mut pending: Option<(tiny_skia::Path, FillRule)> =
                 Some((make_clip_path(), FillRule::Winding));
@@ -11125,6 +11152,73 @@ mod tests {
             "{N} W operators each followed by {K} paint ops must materialize \
              exactly {N} times (got {after_n_clips})"
         );
+    }
+
+    /// A `W n` inside a nested `q` scope must not narrow the mask the
+    /// enclosing scope is still holding (FastPDF-fdn).
+    ///
+    /// This is the one thing the copy-on-write clip stack can get wrong. With
+    /// `Vec<Option<Mask>>` every `q` handed the child its own deep copy, so
+    /// in-place mutation was safe and cost a full-surface memcpy per `q`.
+    /// With `Vec<Option<Arc<Mask>>>` parent and child share one mask until
+    /// somebody writes, and only `Arc::make_mut` in `apply_pending_clip`
+    /// keeps the child's `W n` off the parent's copy. Replace that
+    /// `make_mut` with a plain deref and this test fails while every
+    /// performance number stays exactly as good — which is why it exists.
+    #[test]
+    fn nested_clip_does_not_leak_into_the_enclosing_scope() {
+        use crate::content::GraphicsStateStack;
+        use tiny_skia::{FillRule, PathBuilder, Pixmap, Rect, Transform};
+
+        let _guard = APC_PROBE_LOCK.lock().unwrap();
+
+        let pixmap = Pixmap::new(200, 200).expect("pixmap");
+        let gs_stack = GraphicsStateStack::new();
+        let base_transform = Transform::identity();
+
+        let rect_path = |x: f32, y: f32, w: f32, h: f32| {
+            let mut pb = PathBuilder::new();
+            pb.push_rect(Rect::from_xywh(x, y, w, h).unwrap());
+            pb.finish().unwrap()
+        };
+
+        // Outer scope clips to the left half.
+        let mut clip_stack: Vec<Option<std::sync::Arc<tiny_skia::Mask>>> = vec![None];
+        let mut pending = Some((rect_path(0.0, 0.0, 100.0, 200.0), FillRule::Winding));
+        apply_pending_clip(&mut pending, &mut clip_stack, &pixmap, base_transform, &gs_stack);
+
+        // `q` — the child shares the parent's mask rather than copying it.
+        let inherited = clip_stack.last().cloned().flatten();
+        clip_stack.push(inherited);
+
+        // The child clips further, to the top-left quadrant.
+        let mut pending = Some((rect_path(0.0, 0.0, 100.0, 100.0), FillRule::Winding));
+        apply_pending_clip(&mut pending, &mut clip_stack, &pixmap, base_transform, &gs_stack);
+
+        let sample =
+            |mask: &tiny_skia::Mask, x: u32, y: u32| mask.data()[(y * mask.width() + x) as usize];
+
+        let child = clip_stack
+            .last()
+            .and_then(|c| c.as_deref())
+            .expect("child scope has a clip");
+        assert_eq!(sample(child, 50, 50), 255, "child keeps the top-left quadrant");
+        assert_eq!(sample(child, 50, 150), 0, "child excludes the bottom-left quadrant");
+
+        // `Q` — and the parent must be exactly what it was before the child
+        // narrowed anything: the whole left half, bottom included.
+        clip_stack.pop();
+        let parent = clip_stack
+            .last()
+            .and_then(|c| c.as_deref())
+            .expect("parent scope has a clip");
+        assert_eq!(sample(parent, 50, 50), 255, "parent keeps the top-left quadrant");
+        assert_eq!(
+            sample(parent, 50, 150),
+            255,
+            "the nested clip leaked: the parent lost the bottom-left quadrant,              so content painted after `Q` would be wrongly clipped"
+        );
+        assert_eq!(sample(parent, 150, 50), 0, "parent still excludes the right half");
     }
 
     /// `type3_font_matrix` returns the explicit `/FontMatrix` when well-formed,
